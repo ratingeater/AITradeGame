@@ -90,3 +90,8 @@ build_package.py
 build_all.py
 AITradeGame.db.backup
 .claude/
+
+# Tempo
+node_modules
+**/tempobook/dynamic/
+**/tempobook/storyboards/

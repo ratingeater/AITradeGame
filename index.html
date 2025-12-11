@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <script>
+      window.addEventListener('error', function(event) {
+        var div = document.createElement('div');
+        div.style.position = 'fixed';
+        div.style.top = '0';
+        div.style.left = '0';
+        div.style.width = '100%';
+        div.style.padding = '20px';
+        div.style.background = '#fee2e2';
+        div.style.color = '#991b1b';
+        div.style.zIndex = '9999';
+        div.style.borderBottom = '1px solid #f87171';
+        div.innerHTML = '<strong>Runtime Error:</strong><br>' + event.message;
+        document.body.appendChild(div);
+      });
+    </script>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Tempo App</title>
+  </head>
+  <body>
+    <div id="root">Loading...</div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
