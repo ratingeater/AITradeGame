@@ -18,6 +18,11 @@ export default function ModelSettingsModal({ isOpen, onClose, modelId, modelName
       passphrase: '',
       isSimulation: true,
       enabled: false
+    },
+    arbitrage: {
+      min_net_spread_pct: 0.05,
+      max_capital_ratio: 0.1,
+      taker_fee: 0.001
     }
   });
 
@@ -31,38 +36,24 @@ export default function ModelSettingsModal({ isOpen, onClose, modelId, modelName
   const fetchModelConfig = async () => {
     setLoading(true);
     try {
-      // We fetch the model details which includes the config
-      // Note: The backend get_model returns the config string, we need to parse it
-      // But wait, the current get_model API returns the whole model object.
-      // Let's assume the backend returns 'config' field as a JSON string or dict.
-      // Based on my python code: `db.get_model` returns a dict. `config` is a text column.
-      // So it will be a string.
-      
-      // Actually, I didn't update get_model to parse JSON. It returns raw DB row.
-      // So it will be a string.
-      
       const res = await fetch(`/api/models?t=${Date.now()}`); 
       
       if (res.ok) {
         const models = await res.json();
-        console.log("Fetched models:", models);
         const model = models.find((m: any) => m.id === modelId);
-        console.log("Found model:", model);
         if (model) {
           try {
             let parsedConfig = {};
             if (model.config) {
                 parsedConfig = typeof model.config === 'string' ? JSON.parse(model.config) : model.config;
             }
-            console.log("Parsed config:", parsedConfig);
             
-            if (parsedConfig && (parsedConfig as any).okx) {
-              console.log("Setting OKX config:", (parsedConfig as any).okx);
-              setConfig(prev => ({
-                ...prev,
-                okx: { ...prev.okx, ...(parsedConfig as any).okx }
-              }));
-            }
+            // Merge with defaults
+            setConfig(prev => ({
+              ...prev,
+              okx: { ...prev.okx, ...(parsedConfig as any).okx },
+              arbitrage: { ...prev.arbitrage, ...(parsedConfig as any).arbitrage }
+            }));
           } catch (e) {
             console.error("Failed to parse config", e);
           }
@@ -72,6 +63,38 @@ export default function ModelSettingsModal({ isOpen, onClose, modelId, modelName
       console.error("Failed to fetch model settings", e);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleResetCapital = async () => {
+    if (!confirm("Are you sure you want to reset the initial capital to the current account value? This will reset your ROI calculation.")) return;
+    
+    try {
+        const res = await fetch(`/api/models/${modelId}/reset_capital`, { method: 'POST' });
+        if (res.ok) {
+            alert("Initial capital reset successfully!");
+        } else {
+            alert("Failed to reset capital");
+        }
+    } catch (e) {
+        console.error(e);
+        alert("Error resetting capital");
+    }
+  };
+
+  const handleClearHistory = async () => {
+    if (!confirm("Are you sure you want to clear all trade history and reset the chart? This cannot be undone.")) return;
+    
+    try {
+        const res = await fetch(`/api/models/${modelId}/clear_history`, { method: 'POST' });
+        if (res.ok) {
+            alert("Trade history cleared successfully!");
+        } else {
+            alert("Failed to clear history");
+        }
+    } catch (e) {
+        console.error(e);
+        alert("Error clearing history");
     }
   };
 
@@ -185,6 +208,63 @@ export default function ModelSettingsModal({ isOpen, onClose, modelId, modelName
                   )}
                 </div>
               )}
+
+              <h4 style={{marginTop: '20px'}}>Arbitrage Strategy Parameters</h4>
+              <div style={{padding: '15px', background: '#f8f9fa', borderRadius: '8px', border: '1px solid #eee'}}>
+                <div className="form-group">
+                    <label>Min Net Spread % (Min Profit)</label>
+                    <input 
+                      type="number" 
+                      step="0.01"
+                      className="form-input" 
+                      value={config.arbitrage?.min_net_spread_pct || 0.05}
+                      onChange={(e) => setConfig({...config, arbitrage: {...config.arbitrage, min_net_spread_pct: parseFloat(e.target.value)}})}
+                    />
+                    <small className="text-muted">Minimum profit margin after fees (Default: 0.05%)</small>
+                </div>
+                <div className="form-group">
+                    <label>Max Capital Ratio per Trade</label>
+                    <input 
+                      type="number" 
+                      step="0.1"
+                      max="1.0"
+                      className="form-input" 
+                      value={config.arbitrage?.max_capital_ratio || 0.1}
+                      onChange={(e) => setConfig({...config, arbitrage: {...config.arbitrage, max_capital_ratio: parseFloat(e.target.value)}})}
+                    />
+                    <small className="text-muted">Percentage of available cash to use per trade (0.1 = 10%)</small>
+                </div>
+                <div className="form-group">
+                    <label>Taker Fee Rate %</label>
+                    <input 
+                      type="number" 
+                      step="0.001"
+                      className="form-input" 
+                      value={(config.arbitrage?.taker_fee || 0.001) * 100}
+                      onChange={(e) => setConfig({...config, arbitrage: {...config.arbitrage, taker_fee: parseFloat(e.target.value) / 100}})}
+                    />
+                    <small className="text-muted">Exchange fee rate (Default: 0.1%)</small>
+                </div>
+              </div>
+
+              <h4 style={{marginTop: '20px', color: '#f53f3f'}}>Reset Actions</h4>
+              <div style={{padding: '15px', background: '#fff5f5', borderRadius: '8px', border: '1px solid #ffcfcf'}}>
+                  <div style={{display: 'flex', gap: '10px', flexDirection: 'column'}}>
+                      <button className="btn-secondary" onClick={handleResetCapital} style={{fontSize: '12px', width: '100%', borderColor: '#ffcfcf', color: '#d32029'}}>
+                          Reset ROI Baseline (Sync Initial Capital)
+                      </button>
+                      <div className="text-muted" style={{fontSize: '10px'}}>
+                          Use this if your ROI is incorrect (e.g. -95%) after connecting OKX.
+                      </div>
+                      
+                      <button className="btn-secondary" onClick={handleClearHistory} style={{fontSize: '12px', width: '100%', borderColor: '#ffcfcf', color: '#d32029', marginTop: '10px'}}>
+                          Clear Trade History & Reset Chart
+                      </button>
+                      <div className="text-muted" style={{fontSize: '10px'}}>
+                          Deletes all trade logs and resets the performance chart.
+                      </div>
+                  </div>
+              </div>
             </>
           )}
         </div>

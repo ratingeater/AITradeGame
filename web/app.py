@@ -4,12 +4,13 @@ import os
 # Add project root to sys.path to allow importing core and infra modules
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, make_response
 from flask_cors import CORS
 import time
 import threading
 import json
 import re
+import functools
 from datetime import datetime
 from core.engine.trading_engine import TradingEngine
 from core.market.market_data_service import MarketDataService
@@ -21,6 +22,57 @@ from version import __version__, __github_owner__, __repo__, GITHUB_REPO_URL, LA
 
 app = Flask(__name__)
 CORS(app)
+
+# Auth Configuration
+AUTH_PASSWORD = os.environ.get('AUTH_PASSWORD', 'admin')
+
+@app.route('/api/login', methods=['POST'])
+def login():
+    data = request.json
+    print(f"[DEBUG] Login attempt. Data: {data}")
+    if not data:
+        print("[DEBUG] No JSON data received")
+        return jsonify({'error': 'No data'}), 400
+        
+    password = data.get('password', '').strip()
+    print(f"[DEBUG] Password received: '{password}', Expected: '{AUTH_PASSWORD}'")
+    
+    if password == AUTH_PASSWORD:
+        # Simple token implementation: just return the password as the token
+        # In production, use JWT
+        return jsonify({'token': password})
+    return jsonify({'error': 'Invalid password'}), 401
+
+@app.before_request
+def check_auth():
+    # Skip auth for OPTIONS (CORS)
+    if request.method == 'OPTIONS':
+        return
+        
+    # Skip auth for static files and frontend entry
+    if not request.path.startswith('/api/'):
+        return
+        
+    # Public API endpoints
+    public_endpoints = ['/api/login', '/api/health', '/api/version', '/api/check-update']
+    if request.path in public_endpoints:
+        return
+        
+    # Check Authorization header
+    auth_header = request.headers.get('Authorization')
+    if not auth_header:
+        # print(f"[DEBUG] Missing Auth header for {request.path}")
+        return jsonify({'error': 'Missing Authorization header'}), 401
+        
+    # Format: "Bearer <token>"
+    try:
+        token = auth_header.split(" ")[1]
+        if token != AUTH_PASSWORD:
+            print(f"[DEBUG] Invalid token: '{token}' != '{AUTH_PASSWORD}'")
+            return jsonify({'error': 'Invalid token'}), 401
+    except IndexError:
+        print(f"[DEBUG] Invalid Auth header format: {auth_header}")
+        return jsonify({'error': 'Invalid Authorization header format'}), 401
 
 db = Database(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'AITradeGame.db'))
 market_service = MarketDataService()
@@ -240,14 +292,145 @@ def toggle_model(model_id):
     try:
         data = request.json
         is_active = data.get('is_active', True)
+        close_positions = data.get('close_positions', False)
+        
+        print(f"[INFO] Toggle Model {model_id}: Active={is_active}, ClosePos={close_positions}")
+
+        # 1. Update DB Status FIRST to prevent loop from picking it up again
         db.toggle_model_status(model_id, is_active)
         
-        # If disabling, remove from running engines immediately
+        # 2. If disabling and close_positions requested
+        if not is_active and close_positions:
+            print(f"[INFO] Stopping model {model_id} and closing all positions...")
+            
+            # Get or create engine
+            engine = trading_engines.get(model_id)
+            if not engine:
+                # Create temp engine
+                model = db.get_model(model_id)
+                if model:
+                    strategy_type = model.get('strategy_type', 'arbitrage')
+                    if strategy_type == 'arbitrage':
+                        strategy = ArbitrageStrategy(model_id, market_service, {})
+                    else:
+                        strategy = LLMJsonStrategy(model_id, None, {})
+                        
+                    engine = TradingEngine(model_id, db, market_service, strategy)
+            
+            if engine:
+                # Get runtime config for keys
+                runtime_config = {}
+                model_data = db.get_model(model_id)
+                if model_data and model_data.get('config'):
+                    try:
+                        runtime_config.update(json.loads(model_data['config']))
+                    except: pass
+                
+                # Execute close (Thread-safe due to lock in engine)
+                results = engine.close_all_positions(runtime_config)
+                print(f"[INFO] Close results: {results}")
+        
+        # 3. If disabling, remove from running engines immediately
         if not is_active and model_id in trading_engines:
             del trading_engines[model_id]
             print(f"[INFO] Model {model_id} deactivated and removed from engines")
             
         return jsonify({'message': 'Model status updated'})
+    except Exception as e:
+        print(f"[ERROR] Toggle failed: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/models/<int:model_id>/reset_capital', methods=['POST'])
+def reset_model_capital(model_id):
+    """Reset model's initial capital to current total value"""
+    try:
+        # Get current portfolio value
+        prices_data = market_service.get_current_prices(['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE'])
+        current_prices = {coin: prices_data[coin]['price'] for coin in prices_data}
+        
+        # We need to get the portfolio first to know the real total value (especially if OKX synced)
+        # But get_portfolio is an API handler, let's reuse the logic or call the DB directly
+        # However, if OKX is synced, the DB might not have the latest value if the loop hasn't run.
+        # So we should trigger a sync or trust the last known value.
+        
+        # Let's try to fetch from OKX if configured, similar to get_portfolio
+        model = db.get_model(model_id)
+        if not model:
+            return jsonify({'error': 'Model not found'}), 404
+            
+        current_total_value = model['initial_capital'] # Default
+        
+        # Check OKX config
+        if model.get('config'):
+            config = json.loads(model['config'])
+            if config.get('okx') and config['okx'].get('enabled'):
+                try:
+                    okx_config = config['okx']
+                    if okx_config.get('apiKey'):
+                        import ccxt
+                        exchange = ccxt.okx({
+                            'apiKey': okx_config['apiKey'],
+                            'secret': okx_config['secret'],
+                            'password': okx_config.get('passphrase'),
+                        })
+                        if okx_config.get('isSimulation'):
+                            exchange.set_sandbox_mode(True)
+                        
+                        balance = exchange.fetch_balance()
+                        total_usdt = balance['total'].get('USDT', 0)
+                        current_total_value = total_usdt
+                        
+                        # Try totalEq
+                        if 'info' in balance and 'data' in balance['info'] and len(balance['info']['data']) > 0:
+                             raw_data = balance['info']['data'][0]
+                             if 'totalEq' in raw_data:
+                                 current_total_value = float(raw_data['totalEq'])
+                except Exception as e:
+                    print(f"[WARN] Failed to sync OKX for reset: {e}")
+                    # Fallback to DB portfolio value
+                    portfolio = db.get_portfolio(model_id, current_prices)
+                    current_total_value = portfolio['total_value']
+        else:
+             # Use DB portfolio value
+             portfolio = db.get_portfolio(model_id, current_prices)
+             current_total_value = portfolio['total_value']
+
+        # Update initial_capital in DB
+        conn = db.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('UPDATE models SET initial_capital = ? WHERE id = ?', (current_total_value, model_id))
+        conn.commit()
+        conn.close()
+        
+        # Also clear trade history? Maybe optional. For now just reset capital base.
+        # cursor.execute('DELETE FROM trades WHERE model_id = ?', (model_id,))
+        
+        return jsonify({
+            'message': 'Initial capital reset successfully', 
+            'new_capital': current_total_value
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/models/<int:model_id>/clear_history', methods=['POST'])
+def clear_model_history(model_id):
+    """Clear trade history and reset PnL for a model"""
+    try:
+        conn = db.get_connection()
+        cursor = conn.cursor()
+        
+        # Delete trades
+        cursor.execute('DELETE FROM trades WHERE model_id = ?', (model_id,))
+        
+        # Delete account value history to reset the chart
+        cursor.execute('DELETE FROM account_value_history WHERE model_id = ?', (model_id,))
+        
+        conn.commit()
+        conn.close()
+        
+        return jsonify({'message': 'Trade history and chart data cleared successfully'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -644,6 +827,14 @@ def trading_loop():
                     log(f"[ERROR] Failed to write debug log for model {model['id']}: {e}")
 
             # Initialize engines for active models
+            active_model_ids = set(m['id'] for m in active_models)
+            
+            # Remove inactive engines
+            for model_id in list(trading_engines.keys()):
+                if model_id not in active_model_ids:
+                    log(f"[INFO] Removing inactive engine for Model {model_id}")
+                    del trading_engines[model_id]
+
             for model in active_models:
                 model_id = model['id']
                 if model_id not in trading_engines:

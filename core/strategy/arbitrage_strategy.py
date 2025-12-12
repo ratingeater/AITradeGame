@@ -14,6 +14,10 @@ class ArbitrageStrategy(StrategyBase):
         # Allow exchanges to be configured via strategy config or context
         configured_exchanges = self.config.get("exchanges", ["Binance", "OKX"])
         
+        # Get parameters from config (with defaults)
+        min_spread = self.config.get("arbitrage", {}).get("min_net_spread_pct", 
+                     self.config.get("min_net_spread_pct", 0.05))
+        
         symbols: List[str] = ctx.extra.get("symbols") if ctx.extra else ["BTC", "ETH"]
         exchanges: List[str] = ctx.extra.get("exchanges") if ctx.extra and ctx.extra.get("exchanges") else configured_exchanges
         
@@ -46,9 +50,6 @@ class ArbitrageStrategy(StrategyBase):
             spread = (best_bid["bid_price"] - best_ask["ask_price"]) / best_ask["ask_price"] * 100
             net_spread = spread - self._total_fee(best_bid, best_ask)
             
-            # Check threshold
-            min_spread = self.config.get("min_net_spread_pct", 0.05)
-
             # Debug log
             print(f"[ARB] {symbol}: Spread {spread:.4f}%, Net {net_spread:.4f}% (Min {min_spread}%)")
             
@@ -92,14 +93,18 @@ class ArbitrageStrategy(StrategyBase):
         return signals
 
     def _total_fee(self, bid, ask) -> float:
-        maker_fee = self.config.get("maker_fee", 0.001)
-        taker_fee = self.config.get("taker_fee", 0.001)
+        # Get fee from config or default
+        maker_fee = self.config.get("arbitrage", {}).get("maker_fee", 0.001)
+        taker_fee = self.config.get("arbitrage", {}).get("taker_fee", 0.001)
+        
         # Assume taker for both legs for safety
         return (taker_fee * 2) * 100
 
     def _calc_size(self, best_ask, ctx: StrategyContext) -> float:
         cash = ctx.portfolio.get("cash", 0)
-        max_ratio = self.config.get("max_capital_ratio", 0.1)
+        max_ratio = self.config.get("arbitrage", {}).get("max_capital_ratio", 
+                    self.config.get("max_capital_ratio", 0.1))
+        
         max_capital = cash * max_ratio
         if best_ask["ask_price"] <= 0:
             return 0.0

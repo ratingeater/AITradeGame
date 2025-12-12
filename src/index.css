@@ -577,6 +577,9 @@ body {
     border-radius: var(--radius);
     width: 500px;
     max-width: 90%;
+    max-height: 85vh;
+    display: flex;
+    flex-direction: column;
     box-shadow: var(--shadow-3);
 }
 
@@ -586,6 +589,7 @@ body {
     display: flex;
     justify-content: space-between;
     align-items: center;
+    flex-shrink: 0;
 }
 
 .modal-header h3 {
@@ -595,6 +599,8 @@ body {
 
 .modal-body {
     padding: 24px;
+    overflow-y: auto;
+    flex: 1;
 }
 
 .modal-footer {
@@ -603,6 +609,7 @@ body {
     display: flex;
     justify-content: flex-end;
     gap: 12px;
+    flex-shrink: 0;
 }
 
 /* Form */

@@ -30,12 +30,40 @@ import { ArbitrageStrategy } from './services/strategies/ArbitrageStrategy';
 import { LLMStrategy } from './services/strategies/LLMStrategy';
 import SettingsModal from './components/SettingsModal';
 import ModelSettingsModal from './components/ModelSettingsModal';
+import LoginModal from './components/LoginModal';
 
 // Default Configuration
 const DEFAULT_API_URL = "https://api.deepseek.com/v3.2_speciale_expires_on_20251215";
 const DEFAULT_MODEL = "deepseek-reasoner";
 
 function App() {
+  const [token, setToken] = useState(() => localStorage.getItem('authToken') || '');
+
+  useEffect(() => {
+    if (token) {
+      localStorage.setItem('authToken', token);
+      
+      const originalFetch = window.fetch;
+      window.fetch = async (input, init) => {
+        const headers = new Headers(init?.headers || {});
+        headers.set('Authorization', `Bearer ${token}`);
+        
+        const newInit = { ...init, headers };
+        const response = await originalFetch(input, newInit);
+        
+        if (response.status === 401) {
+          setToken('');
+          localStorage.removeItem('authToken');
+        }
+        return response;
+      };
+      
+      return () => {
+        window.fetch = originalFetch;
+      };
+    }
+  }, [token]);
+
   const [activeTab, setActiveTab] = useState('positions');
   const [showApiProviderModal, setShowApiProviderModal] = useState(false);
   const [showAddModelModal, setShowAddModelModal] = useState(false);
@@ -346,16 +374,28 @@ function App() {
         }
     }
 
+    let closePositions = false;
+    if (currentStatus) { // Turning OFF
+        // Ask user if they want to close positions
+        if (confirm("Do you want to close all open positions for this strategy before stopping?")) {
+            closePositions = true;
+        }
+    }
+
     try {
       const res = await fetch(`/api/models/${id}/toggle`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ is_active: !currentStatus })
+        body: JSON.stringify({ 
+            is_active: !currentStatus,
+            close_positions: closePositions
+        })
       });
       if (res.ok) {
         // Refresh models to update UI
         const modelsRes = await fetch(`/api/models?t=${Date.now()}`);
         if (modelsRes.ok) setBackendModels(await modelsRes.json());
+        if (closePositions) addLog(`Model ${id} stopped and positions closed.`);
       }
     } catch (e) {
       console.error("Failed to toggle model", e);
@@ -761,6 +801,10 @@ function App() {
     return () => clearInterval(interval);
   }, [isTrading]);
 
+
+  if (!token) {
+    return <LoginModal onLogin={setToken} />;
+  }
 
   return (
     <div className="app-container">

@@ -5,6 +5,8 @@ from core.strategy.base import StrategyBase, StrategyContext, Signal
 from core.market.market_data_service import MarketDataService
 from infra.database import Database
 
+import threading
+
 class TradingEngine:
     def __init__(self, model_id: int, db: Database, market_service: MarketDataService, 
                  strategy: StrategyBase, trade_fee_rate: float = 0.001):
@@ -14,9 +16,11 @@ class TradingEngine:
         self.strategy = strategy
         self.trade_fee_rate = trade_fee_rate
         self.coins = ['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE']
+        self.lock = threading.Lock()
     
     def execute_trading_cycle(self, runtime_config: Dict = None) -> Dict:
-        print(f"[DEBUG] Engine: Executing cycle for model {self.model_id}")
+        with self.lock:
+            print(f"[DEBUG] Engine: Executing cycle for model {self.model_id}")
         try:
             # 1. Get Market State
             market_state = self._get_market_state()
@@ -165,6 +169,61 @@ class TradingEngine:
                 'error': str(e)
             }
     
+    def close_all_positions(self, runtime_config: Dict = None) -> List[Dict]:
+        """Close all open positions immediately"""
+        with self.lock:
+            print(f"[INFO] Closing all positions for model {self.model_id}")
+        results = []
+        
+        try:
+            # 1. Get Market State for current prices
+            market_state = self._get_market_state()
+            current_prices = {coin: market_state[coin]['price'] for coin in market_state}
+            
+            # 2. Get Portfolio
+            portfolio = self.db.get_portfolio(self.model_id, current_prices)
+            
+            # 3. Iterate and close
+            positions = list(portfolio.get('positions', [])) # Copy list
+            if not positions:
+                print("[INFO] No positions to close")
+                return []
+                
+            for pos in positions:
+                coin = pos['coin']
+                side = pos['side']
+                quantity = pos['quantity']
+                
+                # Create a synthetic signal to close
+                signal = Signal(
+                    symbol=coin,
+                    action='close',
+                    quantity=quantity,
+                    leverage=pos['leverage'],
+                    meta={'price': current_prices.get(coin, 0)}
+                )
+                
+                print(f"[EXEC] Closing {side} {quantity} {coin}...")
+                result = self._execute_close(coin, signal, market_state, portfolio, runtime_config)
+                results.append(result)
+                
+            # 4. Update Account Value
+            updated_portfolio = self.db.get_portfolio(self.model_id, current_prices)
+            self.db.record_account_value(
+                self.model_id,
+                updated_portfolio['total_value'],
+                updated_portfolio['cash'],
+                updated_portfolio['positions_value']
+            )
+            
+            return results
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to close all positions: {e}")
+            import traceback
+            print(traceback.format_exc())
+            return [{'error': str(e)}]
+
     def _get_market_state(self) -> Dict:
         # Use MarketDataService's get_spot_snapshot
         return self.market_service.get_spot_snapshot(self.coins)
