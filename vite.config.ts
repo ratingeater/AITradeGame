@@ -11,5 +11,12 @@ export default defineConfig({
     // @ts-ignore
     allowedHosts: process.env.TEMPO === "true" ? true : undefined,
     host: process.env.TEMPO === "true" ? '0.0.0.0' : undefined,
+    proxy: {
+      '/api': {
+        target: 'http://localhost:5001',
+        changeOrigin: true,
+        secure: false,
+      },
+    },
   }
 });

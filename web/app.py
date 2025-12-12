@@ -1,3 +1,9 @@
+import sys
+import os
+
+# Add project root to sys.path to allow importing core and infra modules
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 from flask import Flask, render_template, request, jsonify
 from flask_cors import CORS
 import time
@@ -5,19 +11,21 @@ import threading
 import json
 import re
 from datetime import datetime
-from trading_engine import TradingEngine
-from market_data import MarketDataFetcher
-from ai_trader import AITrader
-from database import Database
+from core.engine.trading_engine import TradingEngine
+from core.market.market_data_service import MarketDataService
+from core.llm.ai_trader import AITrader
+from infra.database import Database
+from core.strategy.llm_json_strategy import LLMJsonStrategy
+from core.strategy.arbitrage_strategy import ArbitrageStrategy
 from version import __version__, __github_owner__, __repo__, GITHUB_REPO_URL, LATEST_RELEASE_URL
 
 app = Flask(__name__)
 CORS(app)
 
-db = Database('AITradeGame.db')
-market_fetcher = MarketDataFetcher()
+db = Database(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'AITradeGame.db'))
+market_service = MarketDataService()
 trading_engines = {}
-auto_trading = True
+auto_trading = False
 TRADE_FEE_RATE = 0.001  # 默认交易费率
 
 @app.route('/')
@@ -114,43 +122,81 @@ def get_models():
 def add_model():
     data = request.json
     try:
-        # Get provider info
-        provider = db.get_provider(data['provider_id'])
-        if not provider:
-            return jsonify({'error': 'Provider not found'}), 404
+        strategy_type = data.get('strategy_type', 'llm_json')
+        provider_id = data.get('provider_id')
+        
+        # Validate provider only if needed
+        if strategy_type == 'llm_json':
+            if not provider_id:
+                return jsonify({'error': 'Provider is required for AI Trader'}), 400
+            
+            # Convert to int if it's a string
+            try:
+                provider_id = int(provider_id)
+            except (ValueError, TypeError):
+                return jsonify({'error': 'Invalid provider ID'}), 400
+
+            provider = db.get_provider(provider_id)
+            if not provider:
+                return jsonify({'error': 'Provider not found'}), 404
+        
+        # Ensure provider_id is None if empty (for Arbitrage)
+        if not provider_id:
+            provider_id = None
+        else:
+            try:
+                provider_id = int(provider_id)
+            except:
+                provider_id = None
 
         model_id = db.add_model(
             name=data['name'],
-            provider_id=data['provider_id'],
-            model_name=data['model_name'],
-            initial_capital=float(data.get('initial_capital', 100000))
+            provider_id=provider_id,
+            model_name=data.get('model_name', ''),
+            initial_capital=float(data.get('initial_capital', 100000)),
+            strategy_type=strategy_type
         )
 
         model = db.get_model(model_id)
         
-        # Get provider info
-        provider = db.get_provider(model['provider_id'])
-        if not provider:
-            return jsonify({'error': 'Provider not found'}), 404
-        
-        trading_engines[model_id] = TradingEngine(
-            model_id=model_id,
-            db=db,
-            market_fetcher=market_fetcher,
-            ai_trader=AITrader(
-                provider_type=provider['provider_type'],
+        # Initialize Strategy
+        if strategy_type == 'arbitrage':
+            strategy = ArbitrageStrategy(
+                model_id=model_id,
+                market_service=market_service,
+                config={'min_net_spread_pct': 0.01}
+            )
+        else:
+            # Default to LLM Strategy
+            # We already validated provider exists above
+            provider = db.get_provider(provider_id)
+            ai_trader = AITrader(
+                provider_type=provider.get('provider_type', 'openai'),
                 api_key=provider['api_key'],
                 api_url=provider['api_url'],
                 model_name=model['model_name']
-            ),
-            trade_fee_rate=TRADE_FEE_RATE  # 新增：传入费率
+            )
+            strategy = LLMJsonStrategy(
+                model_id=model_id,
+                trader=ai_trader,
+                config={}
+            )
+
+        trading_engines[model_id] = TradingEngine(
+            model_id=model_id,
+            db=db,
+            market_service=market_service,
+            strategy=strategy,
+            trade_fee_rate=TRADE_FEE_RATE
         )
-        print(f"[INFO] Model {model_id} ({data['name']}) initialized")
+        print(f"[INFO] Model {model_id} ({data['name']}) initialized with {strategy_type} strategy")
 
         return jsonify({'id': model_id, 'message': 'Model added successfully'})
 
     except Exception as e:
         print(f"[ERROR] Failed to add model: {e}")
+        import traceback
+        print(traceback.format_exc())
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/models/<int:model_id>', methods=['DELETE'])
@@ -171,7 +217,7 @@ def delete_model(model_id):
 
 @app.route('/api/models/<int:model_id>/portfolio', methods=['GET'])
 def get_portfolio(model_id):
-    prices_data = market_fetcher.get_current_prices(['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE'])
+    prices_data = market_service.get_current_prices(['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE'])
     current_prices = {coin: prices_data[coin]['price'] for coin in prices_data}
     
     portfolio = db.get_portfolio(model_id, current_prices)
@@ -191,13 +237,15 @@ def get_trades(model_id):
 @app.route('/api/models/<int:model_id>/conversations', methods=['GET'])
 def get_conversations(model_id):
     limit = request.args.get('limit', 20, type=int)
+    print(f"[DEBUG] API: Fetching conversations for model {model_id}, limit={limit}", flush=True)
     conversations = db.get_conversations(model_id, limit=limit)
+    print(f"[DEBUG] API: Found {len(conversations)} conversations", flush=True)
     return jsonify(conversations)
 
 @app.route('/api/aggregated/portfolio', methods=['GET'])
 def get_aggregated_portfolio():
     """Get aggregated portfolio data across all models"""
-    prices_data = market_fetcher.get_current_prices(['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE'])
+    prices_data = market_service.get_current_prices(['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE'])
     current_prices = {coin: prices_data[coin]['price'] for coin in prices_data}
 
     # Get aggregated data
@@ -272,8 +320,50 @@ def get_models_chart_data():
 @app.route('/api/market/prices', methods=['GET'])
 def get_market_prices():
     coins = ['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE']
-    prices = market_fetcher.get_current_prices(coins)
+    prices = market_service.get_current_prices(coins)
     return jsonify(prices)
+
+@app.route('/api/control/start', methods=['POST'])
+def start_auto_trading():
+    global auto_trading
+    if not auto_trading:
+        auto_trading = True
+        # Start trading thread
+        thread = threading.Thread(target=trading_loop, daemon=True)
+        thread.start()
+        print("[INFO] Auto-trading started via API")
+    return jsonify({'status': 'started', 'auto_trading': True})
+
+@app.route('/api/control/stop', methods=['POST'])
+def stop_auto_trading():
+    global auto_trading
+    if auto_trading:
+        auto_trading = False
+        print("[INFO] Auto-trading stopped via API")
+    return jsonify({'status': 'stopped', 'auto_trading': False})
+
+@app.route('/api/status', methods=['GET'])
+def get_system_status():
+    """Get system status including trading loop status"""
+    active_models = db.get_active_models()
+    return jsonify({
+        'status': 'running',
+        'timestamp': datetime.now().isoformat(),
+        'auto_trading': auto_trading,
+        'active_engines': list(trading_engines.keys()),
+        'active_models_count': len(active_models),
+        'trading_engines_count': len(trading_engines),
+        'version': __version__
+    })
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    return jsonify({'status': 'ok', 'version': __version__})
+
+@app.errorhandler(404)
+def page_not_found(e):
+    print(f"[404] Not Found: {request.url}", flush=True)
+    return jsonify(error="Resource not found", path=request.path), 404
 
 @app.route('/api/models/<int:model_id>/execute', methods=['POST'])
 def execute_trading(model_id):
@@ -282,21 +372,42 @@ def execute_trading(model_id):
         if not model:
             return jsonify({'error': 'Model not found'}), 404
 
-        # Get provider info
-        provider = db.get_provider(model['provider_id'])
-        if not provider:
-            return jsonify({'error': 'Provider not found'}), 404
+        strategy_type = model.get('strategy_type', 'llm_json')
+        
+        # Initialize Strategy
+        if strategy_type == 'arbitrage':
+            strategy = ArbitrageStrategy(
+                model_id=model_id,
+                market_service=market_service,
+                config={'min_net_spread_pct': 0.01}
+            )
+        else:
+            # Get provider info
+            if not model['provider_id']:
+                 return jsonify({'error': 'Provider ID missing for LLM strategy'}), 400
+                 
+            provider = db.get_provider(model['provider_id'])
+            if not provider:
+                return jsonify({'error': 'Provider not found'}), 404
+
+            ai_trader = AITrader(
+                provider_type=provider.get('provider_type', 'openai'),
+                api_key=provider['api_key'],
+                api_url=provider['api_url'],
+                model_name=model['model_name']
+            )
+            strategy = LLMJsonStrategy(
+                model_id=model_id,
+                trader=ai_trader,
+                config={}
+            )
 
         trading_engines[model_id] = TradingEngine(
             model_id=model_id,
             db=db,
-            market_fetcher=market_fetcher,
-            ai_trader=AITrader(
-                api_key=provider['api_key'],
-                api_url=provider['api_url'],
-                model_name=model['model_name']
-            ),
-            trade_fee_rate=TRADE_FEE_RATE  # 新增：传入费率
+            market_service=market_service,
+            strategy=strategy,
+            trade_fee_rate=TRADE_FEE_RATE
         )
     
     try:
@@ -306,54 +417,143 @@ def execute_trading(model_id):
         return jsonify({'error': str(e)}), 500
 
 def trading_loop():
-    print("[INFO] Trading loop started")
+    # Setup file logging
+    log_file = open('backend.log', 'a')
+    def log(msg):
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[{timestamp}] {msg}", flush=True)
+        log_file.write(f"[{timestamp}] {msg}\n")
+        log_file.flush()
+
+    log("[INFO] Trading loop started")
     
+    # Log startup to DB for the first available model to confirm loop start
+    try:
+        models = db.get_all_models()
+        if models:
+            db.add_conversation(
+                models[0]['id'],
+                user_prompt="System Startup",
+                ai_response=json.dumps({
+                    "message": f"Trading Loop Started. Time: {datetime.now().strftime('%H:%M:%S')}",
+                    "version": __version__
+                }, ensure_ascii=False)
+            )
+    except Exception as e:
+        log(f"[WARN] Failed to log startup: {e}")
+
     while auto_trading:
         try:
+            # Refresh active models from DB
+            active_models = db.get_active_models()
+            log(f"[DEBUG] Loop iteration. Active models: {len(active_models)}, Engines: {len(trading_engines)}")
+            
+            # FORCE LOG: Write a heartbeat to DB for all active models to prove loop is running
+            for model in active_models:
+                try:
+                    db.add_conversation(
+                        model['id'],
+                        user_prompt="System Debug",
+                        ai_response=json.dumps({
+                            "message": f"Trading Loop Active. Time: {datetime.now().strftime('%H:%M:%S')}",
+                            "engine_status": "Running" if model['id'] in trading_engines else "Initializing"
+                        }, ensure_ascii=False)
+                    )
+                except Exception as e:
+                    log(f"[ERROR] Failed to write debug log for model {model['id']}: {e}")
+
+            # Initialize engines for active models
+            for model in active_models:
+                model_id = model['id']
+                if model_id not in trading_engines:
+                    log(f"[INFO] Initializing engine for Model {model_id} ({model['strategy_type']})")
+                    
+                    strategy_type = model.get('strategy_type', 'llm_json')
+                    
+                    # Initialize Strategy
+                    if strategy_type == 'arbitrage':
+                        strategy = ArbitrageStrategy(
+                            model_id=model_id,
+                            market_service=market_service,
+                            config={'min_net_spread_pct': -5.0} # Debug: Force trades
+                        )
+                    else:
+                        # Get provider info
+                        if not model['provider_id']:
+                            log(f"[WARN] Model {model_id} missing provider_id")
+                            continue
+                            
+                        provider = db.get_provider(model['provider_id'])
+                        if not provider:
+                            log(f"[WARN] Model {model_id} provider not found")
+                            continue
+
+                        ai_trader = AITrader(
+                            provider_type=provider.get('provider_type', 'openai'),
+                            api_key=provider['api_key'],
+                            api_url=provider['api_url'],
+                            model_name=model['model_name']
+                        )
+                        strategy = LLMJsonStrategy(
+                            model_id=model_id,
+                            trader=ai_trader,
+                            config={}
+                        )
+
+                    trading_engines[model_id] = TradingEngine(
+                        model_id=model_id,
+                        db=db,
+                        market_service=market_service,
+                        strategy=strategy,
+                        trade_fee_rate=TRADE_FEE_RATE
+                    )
+
             if not trading_engines:
-                time.sleep(30)
+                log("[INFO] No active trading engines. Waiting...")
+                time.sleep(10)
                 continue
             
-            print(f"\n{'='*60}")
-            print(f"[CYCLE] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            print(f"[INFO] Active models: {len(trading_engines)}")
-            print(f"{'='*60}")
+            log(f"[CYCLE] Active models: {len(trading_engines)}")
             
             for model_id, engine in list(trading_engines.items()):
                 try:
-                    print(f"\n[EXEC] Model {model_id}")
+                    log(f"[EXEC] Model {model_id}")
                     result = engine.execute_trading_cycle()
                     
                     if result.get('success'):
-                        print(f"[OK] Model {model_id} completed")
+                        log(f"[OK] Model {model_id} completed")
                         if result.get('executions'):
                             for exec_result in result['executions']:
                                 signal = exec_result.get('signal', 'unknown')
                                 coin = exec_result.get('coin', 'unknown')
                                 msg = exec_result.get('message', '')
                                 if signal != 'hold':
-                                    print(f"  [TRADE] {coin}: {msg}")
+                                    log(f"  [TRADE] {coin}: {msg}")
                     else:
                         error = result.get('error', 'Unknown error')
-                        print(f"[WARN] Model {model_id} failed: {error}")
+                        log(f"[WARN] Model {model_id} failed: {error}")
                         
                 except Exception as e:
-                    print(f"[ERROR] Model {model_id} exception: {e}")
+                    log(f"[ERROR] Model {model_id} exception: {e}")
                     import traceback
-                    print(traceback.format_exc())
+                    log(traceback.format_exc())
                     continue
             
-            print(f"\n{'='*60}")
-            print(f"[SLEEP] Waiting 3 minutes for next cycle")
-            print(f"{'='*60}\n")
+            # Get sleep time from settings
+            settings = db.get_settings()
+            sleep_minutes = settings.get('trading_frequency_minutes', 1)
+            # Cap at 60 seconds for simulation responsiveness, regardless of DB setting
+            sleep_seconds = max(10, min(sleep_minutes * 60, 60))
+
+            log(f"[SLEEP] Waiting {sleep_seconds} seconds for next cycle")
             
-            time.sleep(180)
+            time.sleep(sleep_seconds)
             
         except Exception as e:
-            print(f"\n[CRITICAL] Trading loop error: {e}")
+            log(f"[CRITICAL] Trading loop error: {e}")
             import traceback
-            print(traceback.format_exc())
-            print("[RETRY] Retrying in 60 seconds\n")
+            log(traceback.format_exc())
+            log("[RETRY] Retrying in 60 seconds")
             time.sleep(60)
     
     print("[INFO] Trading loop stopped")
@@ -363,7 +563,7 @@ def get_leaderboard():
     models = db.get_all_models()
     leaderboard = []
     
-    prices_data = market_fetcher.get_current_prices(['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE'])
+    prices_data = market_service.get_current_prices(['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE'])
     current_prices = {coin: prices_data[coin]['price'] for coin in prices_data}
     
     for model in models:
@@ -374,6 +574,7 @@ def get_leaderboard():
         leaderboard.append({
             'model_id': model['id'],
             'model_name': model['name'],
+            'strategy_type': model.get('strategy_type', 'llm_json'),
             'account_value': account_value,
             'returns': returns,
             'initial_capital': model['initial_capital']
@@ -477,6 +678,81 @@ def check_update():
             'error': str(e)
         }), 500
 
+# ============ OKX Integration ============
+
+@app.route('/api/okx/test', methods=['POST'])
+def okx_test_connection():
+    """Test OKX connection"""
+    data = request.json
+    api_key = data.get('api_key')
+    secret = data.get('secret')
+    passphrase = data.get('passphrase')
+    is_simulation = data.get('is_simulation', True)
+    
+    try:
+        import ccxt
+        exchange = ccxt.okx({
+            'apiKey': api_key,
+            'secret': secret,
+            'password': passphrase,
+        })
+        if is_simulation:
+            exchange.set_sandbox_mode(True)
+            
+        balance = exchange.fetch_balance()
+        return jsonify({'success': True, 'balance': balance['total']})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+
+@app.route('/api/okx/trade', methods=['POST'])
+def okx_trade():
+    """Execute trade on OKX (Demo/Real)"""
+    data = request.json
+    api_key = data.get('api_key')
+    secret = data.get('secret')
+    passphrase = data.get('passphrase')
+    is_simulation = data.get('is_simulation', True)
+    
+    symbol = data.get('symbol')
+    side = data.get('side') # 'buy' or 'sell'
+    amount = data.get('amount')
+    
+    if not all([api_key, secret, passphrase, symbol, side, amount]):
+        return jsonify({'error': 'Missing required parameters'}), 400
+        
+    try:
+        import ccxt
+        
+        exchange = ccxt.okx({
+            'apiKey': api_key,
+            'secret': secret,
+            'password': passphrase,
+            'enableRateLimit': True,
+        })
+        
+        if is_simulation:
+            exchange.set_sandbox_mode(True)
+            
+        # Map symbol (e.g., 'BTC' -> 'BTC/USDT')
+        # Assuming spot trading for now
+        market_symbol = f"{symbol}/USDT"
+        
+        # Execute order
+        # type='market' for simplicity in this demo
+        order = exchange.create_order(market_symbol, 'market', side, amount)
+        
+        return jsonify({
+            'success': True,
+            'order_id': order['id'],
+            'price': order.get('average') or order.get('price'),
+            'filled': order.get('filled'),
+            'status': order.get('status')
+        })
+        
+    except Exception as e:
+        print(f"[ERROR] OKX Trade failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
 def compare_versions(version1, version2):
     """Compare two version strings.
 
@@ -519,28 +795,51 @@ def init_trading_engines():
         for model in models:
             model_id = model['id']
             model_name = model['name']
+            strategy_type = model.get('strategy_type', 'llm_json')
 
             try:
-                # Get provider info
-                provider = db.get_provider(model['provider_id'])
-                if not provider:
-                    print(f"  [WARN] Model {model_id} ({model_name}): Provider not found")
-                    continue
+                # Initialize Strategy
+                if strategy_type == 'arbitrage':
+                    strategy = ArbitrageStrategy(
+                        model_id=model_id,
+                        market_service=market_service,
+                        config={'min_net_spread_pct': -5.0}
+                    )
+                else:
+                    # Get provider info for LLM strategy
+                    if not model['provider_id']:
+                        print(f"  [WARN] Model {model_id} ({model_name}): Missing provider_id for LLM strategy")
+                        continue
+                        
+                    provider = db.get_provider(model['provider_id'])
+                    if not provider:
+                        print(f"  [WARN] Model {model_id} ({model_name}): Provider not found")
+                        continue
+
+                    ai_trader = AITrader(
+                        provider_type=provider.get('provider_type', 'openai'),
+                        api_key=provider['api_key'],
+                        api_url=provider['api_url'],
+                        model_name=model['model_name']
+                    )
+                    strategy = LLMJsonStrategy(
+                        model_id=model_id,
+                        trader=ai_trader,
+                        config={}
+                    )
 
                 trading_engines[model_id] = TradingEngine(
                     model_id=model_id,
                     db=db,
-                    market_fetcher=market_fetcher,
-                    ai_trader=AITrader(
-                        api_key=provider['api_key'],
-                        api_url=provider['api_url'],
-                        model_name=model['model_name']
-                    ),
+                    market_service=market_service,
+                    strategy=strategy,
                     trade_fee_rate=TRADE_FEE_RATE
                 )
-                print(f"  [OK] Model {model_id} ({model_name})")
+                print(f"  [OK] Model {model_id} ({model_name}) - {strategy_type}")
             except Exception as e:
                 print(f"  [ERROR] Model {model_id} ({model_name}): {e}")
+                import traceback
+                print(traceback.format_exc())
                 continue
 
         print(f"[INFO] Initialized {len(trading_engines)} engine(s)\n")
@@ -553,13 +852,28 @@ if __name__ == '__main__':
     import os
     
     print("\n" + "=" * 60)
-    print("AITradeGame - Starting...")
+    print(f"AITradeGame - Starting... (Updated: {datetime.now().strftime('%H:%M:%S')})")
+    print("!!! VERIFY THIS TIMESTAMP MATCHES CURRENT TIME !!!")
     print("=" * 60)
     print("[INFO] Initializing database...")
     
     db.init_db()
     
     print("[INFO] Database initialized")
+
+    # Check if providers exist, if not add default
+    try:
+        if not db.get_all_providers():
+            print("[INIT] Adding default DeepSeek provider...")
+            db.add_provider(
+                name='DeepSeek',
+                api_url='https://api.deepseek.com',
+                api_key='sk-placeholder', # User needs to update this
+                models='deepseek-chat,deepseek-reasoner'
+            )
+    except Exception as e:
+        print(f"[WARN] Failed to add default provider: {e}")
+
     print("[INFO] Initializing trading engines...")
     
     init_trading_engines()
@@ -571,14 +885,14 @@ if __name__ == '__main__':
     
     print("\n" + "=" * 60)
     print("AITradeGame is running!")
-    print("Server: http://localhost:5000")
+    print("Server: http://localhost:5001")
     print("Press Ctrl+C to stop")
     print("=" * 60 + "\n")
     
     # 自动打开浏览器
     def open_browser():
         time.sleep(1.5)  # 等待服务器启动
-        url = "http://localhost:5000"
+        url = "http://localhost:5001"
         try:
             webbrowser.open(url)
             print(f"[INFO] Browser opened: {url}")
@@ -588,4 +902,14 @@ if __name__ == '__main__':
     browser_thread = threading.Thread(target=open_browser, daemon=True)
     browser_thread.start()
     
-    app.run(debug=False, host='0.0.0.0', port=5000, use_reloader=False)
+    try:
+        print(f"[STARTUP] Attempting to start server on port 5001...")
+        app.run(debug=False, host='0.0.0.0', port=5001, use_reloader=False)
+    except OSError as e:
+        if "Address already in use" in str(e):
+            print(f"\n[CRITICAL] Port 5001 is already in use!")
+            print(f"[CRITICAL] Please stop the other running instance or kill the process.")
+            print(f"[CRITICAL] Error: {e}\n")
+        else:
+            print(f"\n[CRITICAL] Failed to start server: {e}\n")
+        sys.exit(1)

@@ -112,17 +112,102 @@ class Database:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 trading_frequency_minutes INTEGER DEFAULT 60,
                 trading_fee_rate REAL DEFAULT 0.001,
+                analysis_interval_seconds INTEGER DEFAULT 3600,
+                arbitrage_scan_interval_seconds INTEGER DEFAULT 60,
+                ip_whitelist TEXT DEFAULT '[]',
+                default_exchange_id INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+
+        # Exchanges table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS exchanges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                label TEXT,
+                api_base_url TEXT,
+                type TEXT DEFAULT 'cex',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # Accounts table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                exchange_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                api_key TEXT,
+                api_secret TEXT,
+                api_passphrase TEXT,
+                read_only INTEGER DEFAULT 1,
+                extra_config TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (exchange_id) REFERENCES exchanges(id)
+            )
+        ''')
+
+        # Analysis Reports table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS analysis_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model_id INTEGER,
+                account_id INTEGER,
+                symbol TEXT,
+                report_type TEXT,
+                content_md TEXT,
+                ai_confidence REAL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # Arbitrage Opportunities table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS arbitrage_opportunities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                buy_exchange_id INTEGER,
+                sell_exchange_id INTEGER,
+                buy_price REAL,
+                sell_price REAL,
+                spread REAL,
+                net_spread REAL,
+                est_pnl REAL,
+                volume REAL,
+                detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # Update Models table (add columns if not exist)
+        try:
+            cursor.execute('ALTER TABLE models ADD COLUMN strategy_type TEXT DEFAULT "llm_json"')
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cursor.execute('ALTER TABLE models ADD COLUMN account_id INTEGER')
+        except sqlite3.OperationalError:
+            pass
+
+        # Update Trades table (add fee column if not exist)
+        try:
+            cursor.execute('ALTER TABLE trades ADD COLUMN fee REAL DEFAULT 0')
+        except sqlite3.OperationalError:
+            pass
+
+        # Update Portfolios table
+        try:
+            cursor.execute('ALTER TABLE portfolios ADD COLUMN account_id INTEGER')
+        except sqlite3.OperationalError:
+            pass
 
         # Insert default settings if no settings exist
         cursor.execute('SELECT COUNT(*) FROM settings')
         if cursor.fetchone()[0] == 0:
             cursor.execute('''
                 INSERT INTO settings (trading_frequency_minutes, trading_fee_rate)
-                VALUES (60, 0.001)
+                VALUES (1, 0.001)
             ''')
 
         conn.commit()
@@ -260,8 +345,8 @@ class Database:
         cursor = conn.cursor()
         cursor.execute('''
             INSERT INTO trades (model_id, coin, signal, quantity, price, leverage, side, pnl, fee)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)  # 新增fee字段
-        ''', (model_id, coin, signal, quantity, price, leverage, side, pnl, fee))  # 传入fee值
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (model_id, coin, signal, quantity, price, leverage, side, pnl, fee))
         conn.commit()
         conn.close()
     
@@ -521,14 +606,14 @@ class Database:
 
     # ============ Model Management (Updated) ============
 
-    def add_model(self, name: str, provider_id: int, model_name: str, initial_capital: float = 10000) -> int:
+    def add_model(self, name: str, provider_id: int, model_name: str, initial_capital: float = 10000, strategy_type: str = 'llm_json', account_id: int = None) -> int:
         """Add new trading model"""
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO models (name, provider_id, model_name, initial_capital)
-            VALUES (?, ?, ?, ?)
-        ''', (name, provider_id, model_name, initial_capital))
+            INSERT INTO models (name, provider_id, model_name, initial_capital, strategy_type, account_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (name, provider_id, model_name, initial_capital, strategy_type, account_id))
         model_id = cursor.lastrowid
         conn.commit()
         conn.close()
@@ -561,4 +646,8 @@ class Database:
         rows = cursor.fetchall()
         conn.close()
         return [dict(row) for row in rows]
+
+    def get_active_models(self) -> List[Dict]:
+        """Get active trading models (currently all models)"""
+        return self.get_all_models()
 
