@@ -11,18 +11,28 @@ class ArbitrageStrategy(StrategyBase):
         self.market_service = market_service
 
     def generate_signals(self, ctx: StrategyContext) -> List[Signal]:
+        # Allow exchanges to be configured via strategy config or context
+        configured_exchanges = self.config.get("exchanges", ["Binance", "OKX"])
+        
         symbols: List[str] = ctx.extra.get("symbols") if ctx.extra else ["BTC", "ETH"]
-        exchanges: List[str] = ctx.extra.get("exchanges") if ctx.extra else ["Binance", "OKX"]
+        exchanges: List[str] = ctx.extra.get("exchanges") if ctx.extra and ctx.extra.get("exchanges") else configured_exchanges
         
         if not symbols or not exchanges:
             return []
 
         opps: List[Dict[str, Any]] = []
+        
+        # Prepare API configs from context
+        api_configs = {}
+        if ctx.extra and ctx.extra.get("okx"):
+            api_configs["okx"] = ctx.extra.get("okx")
+            
         for symbol in symbols:
             # Ensure symbol format (e.g. BTC -> BTC/USDT) if needed, but MarketDataService handles it
-            orderbooks = self.market_service.get_multi_exchange_orderbooks(exchanges, symbol)
+            orderbooks = self.market_service.get_multi_exchange_orderbooks(exchanges, symbol, api_configs)
             
-            if not orderbooks:
+            if not orderbooks or len(orderbooks) < 2:
+                # print(f"[ARB] {symbol}: Insufficient orderbooks ({len(orderbooks) if orderbooks else 0})")
                 continue
 
             # Find best bid (sell high) and best ask (buy low)
@@ -32,25 +42,30 @@ class ArbitrageStrategy(StrategyBase):
             if best_ask["ask_price"] <= 0:
                 continue
 
+            # Calculate spread
             spread = (best_bid["bid_price"] - best_ask["ask_price"]) / best_ask["ask_price"] * 100
             net_spread = spread - self._total_fee(best_bid, best_ask)
             
-            # Debug log
-            print(f"[ARB] {symbol}: Spread {spread:.4f}%, Net {net_spread:.4f}% (Min {self.config.get('min_net_spread_pct', 0.1)}%)")
+            # Check threshold
+            min_spread = self.config.get("min_net_spread_pct", 0.05)
 
-            # FORCE TRADE for debugging if spread is valid number
-            if True: # net_spread >= self.config.get("min_net_spread_pct", 0.05):
+            # Debug log
+            print(f"[ARB] {symbol}: Spread {spread:.4f}%, Net {net_spread:.4f}% (Min {min_spread}%)")
+            
+            # For demo/testing, we might want to be more lenient or strict
+            if net_spread >= min_spread:
                 size = self._calc_size(best_ask, ctx)
-                opps.append({
-                    "symbol": symbol,
-                    "buy_exchange": best_ask["exchange"],
-                    "sell_exchange": best_bid["exchange"],
-                    "buy_price": best_ask["ask_price"],
-                    "sell_price": best_bid["bid_price"],
-                    "spread": spread,
-                    "net_spread": net_spread,
-                    "size": size
-                })
+                if size > 0:
+                    opps.append({
+                        "symbol": symbol,
+                        "buy_exchange": best_ask["exchange"],
+                        "sell_exchange": best_bid["exchange"],
+                        "buy_price": best_ask["ask_price"],
+                        "sell_price": best_bid["bid_price"],
+                        "spread": spread,
+                        "net_spread": net_spread,
+                        "size": size
+                    })
 
         signals: List[Signal] = []
         for op in opps:

@@ -27,6 +27,7 @@ market_service = MarketDataService()
 trading_engines = {}
 auto_trading = False
 TRADE_FEE_RATE = 0.001  # 默认交易费率
+RUNTIME_CONFIGS = {} # Store ephemeral configs like API keys
 
 @app.route('/')
 def index():
@@ -215,13 +216,178 @@ def delete_model(model_id):
         print(f"[ERROR] Delete model {model_id} failed: {e}")
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/models/<int:model_id>/config', methods=['PUT'])
+def update_model_config(model_id):
+    try:
+        print(f"[DEBUG] Received config update for model {model_id}")
+        data = request.json
+        print(f"[DEBUG] Request data: {data}")
+        config = data.get('config', {})
+        if isinstance(config, dict):
+            config_str = json.dumps(config)
+        else:
+            config_str = str(config)
+            
+        print(f"[DEBUG] Saving config string: {config_str}")
+        db.update_model_config(model_id, config_str)
+        return jsonify({'message': 'Model config updated'})
+    except Exception as e:
+        print(f"[ERROR] Update config failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/models/<int:model_id>/toggle', methods=['POST'])
+def toggle_model(model_id):
+    try:
+        data = request.json
+        is_active = data.get('is_active', True)
+        db.toggle_model_status(model_id, is_active)
+        
+        # If disabling, remove from running engines immediately
+        if not is_active and model_id in trading_engines:
+            del trading_engines[model_id]
+            print(f"[INFO] Model {model_id} deactivated and removed from engines")
+            
+        return jsonify({'message': 'Model status updated'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/models/<int:model_id>/portfolio', methods=['GET'])
 def get_portfolio(model_id):
     prices_data = market_service.get_current_prices(['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE'])
     current_prices = {coin: prices_data[coin]['price'] for coin in prices_data}
     
     portfolio = db.get_portfolio(model_id, current_prices)
+    
+    # Sync with OKX if configured
+    try:
+        model = db.get_model(model_id)
+        if model and model.get('config'):
+            config = json.loads(model['config'])
+            if config.get('okx') and config['okx'].get('enabled'):
+                okx_config = config['okx']
+                if okx_config.get('apiKey'):
+                    import ccxt
+                    exchange = ccxt.okx({
+                        'apiKey': okx_config['apiKey'],
+                        'secret': okx_config['secret'],
+                        'password': okx_config.get('passphrase'),
+                    })
+                    if okx_config.get('isSimulation'):
+                        exchange.set_sandbox_mode(True)
+                        print(f"[DEBUG] OKX: Enabled Sandbox Mode for Model {model_id}")
+                    
+                    print(f"[DEBUG] OKX: Fetching balance for Model {model_id}...")
+                    balance = exchange.fetch_balance()
+                    print(f"[DEBUG] OKX: Balance fetched: {balance['total']}")
+                    if 'info' in balance:
+                        print(f"[DEBUG] OKX: Raw Info Sample: {str(balance['info'])[:500]}...")
+                    
+                    free_usdt = balance['free'].get('USDT', 0)
+                    total_usdt = balance['total'].get('USDT', 0)
+                    
+                    # Try to get total equity from OKX specific response (Total Equity in USD)
+                    total_equity = total_usdt
+                    try:
+                        if 'info' in balance and 'data' in balance['info'] and len(balance['info']['data']) > 0:
+                             raw_data = balance['info']['data'][0]
+                             if 'totalEq' in raw_data:
+                                 total_equity = float(raw_data['totalEq'])
+                                 print(f"[DEBUG] OKX: Used totalEq from API: {total_equity}")
+                    except Exception as eq_err:
+                        print(f"[WARN] Failed to parse totalEq: {eq_err}")
+                    
+                    # Sync Positions
+                    try:
+                        print(f"[DEBUG] OKX: Fetching positions for Model {model_id}...")
+                        okx_positions = exchange.fetch_positions()
+                        print(f"[DEBUG] OKX: Found {len(okx_positions)} positions")
+                        
+                        mapped_positions = []
+                        for pos in okx_positions:
+                            # Map OKX position to app format
+                            # OKX: symbol='BTC/USDT:USDT', contracts=1, etc.
+                            # App: coin='BTC', quantity=1, avg_price=..., side='long'
+                            
+                            symbol = pos['symbol']
+                            coin = symbol.split('/')[0] if '/' in symbol else symbol
+                            side = pos['side'] # 'long' or 'short'
+                            if pos['contracts'] == 0: continue # Skip empty
+                            
+                            mapped_positions.append({
+                                'model_id': model_id,
+                                'coin': coin,
+                                'quantity': float(pos['contracts']) if 'contracts' in pos else float(pos['info'].get('pos', 0)),
+                                'avg_price': float(pos['entryPrice']) if pos['entryPrice'] else 0,
+                                'leverage': float(pos['leverage']) if pos['leverage'] else 1,
+                                'side': side,
+                                'current_price': float(pos['markPrice']) if pos['markPrice'] else 0,
+                                'unrealized_pnl': float(pos['unrealizedPnl']) if pos['unrealizedPnl'] else 0,
+                                'updated_at': datetime.now().isoformat()
+                            })
+                        
+                        if mapped_positions:
+                            portfolio['positions'] = mapped_positions
+                            # Recalculate positions value
+                            portfolio['positions_value'] = sum(p['quantity'] * p['current_price'] for p in mapped_positions)
+                        
+                        # Also check for Spot holdings (Assets)
+                        # If fetch_positions (derivatives) is empty or we want to show spot assets too
+                        spot_positions = []
+                        if 'total' in balance:
+                            print(f"[DEBUG] Checking spot assets in balance: {balance['total']}")
+                            print(f"[DEBUG] Current prices keys: {list(current_prices.keys())}")
+                            
+                            for coin, amount in balance['total'].items():
+                                if coin == 'USDT' or amount <= 0: continue
+                                
+                                # Get current price
+                                price = current_prices.get(coin, 0)
+                                if price == 0:
+                                    print(f"[DEBUG] No price for {coin}, skipping spot position")
+                                    continue
+                                    
+                                print(f"[DEBUG] Found spot asset: {coin} {amount} @ {price}")
+                                
+                                spot_positions.append({
+                                    'model_id': model_id,
+                                    'coin': coin,
+                                    'quantity': float(amount),
+                                    'avg_price': 0, # Unknown for spot wallet
+                                    'leverage': 1,
+                                    'side': 'long',
+                                    'current_price': price,
+                                    'unrealized_pnl': 0,
+                                    'updated_at': datetime.now().isoformat(),
+                                    'is_spot': True
+                                })
+                        
+                        if spot_positions:
+                            # Merge or append?
+                            # If we have derivatives positions, they might overlap?
+                            # Usually fetch_positions returns contracts. Spot assets are separate.
+                            if 'positions' not in portfolio: portfolio['positions'] = []
+                            portfolio['positions'].extend(spot_positions)
+                            
+                            # Update total positions value
+                            portfolio['positions_value'] = sum(p['quantity'] * p['current_price'] for p in portfolio['positions'])
+
+                    except Exception as pos_err:
+                        print(f"[WARN] Failed to sync positions: {pos_err}")
+
+                    # Update portfolio view
+                    portfolio['cash'] = free_usdt
+                    portfolio['total_value'] = total_equity
+
+                    portfolio['okx_synced'] = True
+                    # Note: We might want to update positions too, but that's complex mapping.
+                    # For now, total value and cash are the most important.
+    except Exception as e:
+        print(f"[WARN] Failed to sync portfolio with OKX: {e}")
+        portfolio['sync_error'] = str(e)
+
     account_value = db.get_account_value_history(model_id, limit=100)
+    
+    print(f"[DEBUG] Final portfolio positions count: {len(portfolio.get('positions', []))}")
     
     return jsonify({
         'portfolio': portfolio,
@@ -326,6 +492,14 @@ def get_market_prices():
 @app.route('/api/control/start', methods=['POST'])
 def start_auto_trading():
     global auto_trading
+    
+    # Store runtime config if provided
+    data = request.json or {}
+    if 'okx_config' in data:
+        RUNTIME_CONFIGS['okx'] = data['okx_config']
+        market_service.set_api_configs(RUNTIME_CONFIGS) # Update market service
+        print("[INFO] Received OKX config for auto-trading")
+        
     if not auto_trading:
         auto_trading = True
         # Start trading thread
@@ -411,7 +585,14 @@ def execute_trading(model_id):
         )
     
     try:
-        result = trading_engines[model_id].execute_trading_cycle()
+        # Get runtime config from request
+        data = request.json or {}
+        runtime_config = {}
+        if 'okx_config' in data:
+            runtime_config['okx'] = data['okx_config']
+            market_service.set_api_configs(runtime_config) # Update market service
+            
+        result = trading_engines[model_id].execute_trading_cycle(runtime_config=runtime_config)
         return jsonify(result)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -475,7 +656,7 @@ def trading_loop():
                         strategy = ArbitrageStrategy(
                             model_id=model_id,
                             market_service=market_service,
-                            config={'min_net_spread_pct': -5.0} # Debug: Force trades
+                            config={'min_net_spread_pct': 0.01} # 0.01% min profit
                         )
                     else:
                         # Get provider info
@@ -518,7 +699,30 @@ def trading_loop():
             for model_id, engine in list(trading_engines.items()):
                 try:
                     log(f"[EXEC] Model {model_id}")
-                    result = engine.execute_trading_cycle()
+                    
+                    # Prepare runtime config
+                    runtime_config = {}
+                    
+                    # 1. Try to get config from DB model
+                    try:
+                        model_data = db.get_model(model_id)
+                        if model_data and model_data.get('config'):
+                            db_config = json.loads(model_data['config'])
+                            if db_config:
+                                runtime_config.update(db_config)
+                    except Exception as e:
+                        log(f"[WARN] Failed to load model config: {e}")
+
+                    # 2. Merge global ephemeral config (lowest priority or specific overrides?)
+                    # Let's say DB config overrides global for specific keys, but global might have keys not in DB.
+                    # Actually, per-strategy config should take precedence.
+                    if 'okx' in RUNTIME_CONFIGS:
+                        # Only use global if not in DB config? 
+                        # Or merge? Let's merge, but DB wins.
+                        if 'okx' not in runtime_config:
+                            runtime_config['okx'] = RUNTIME_CONFIGS['okx']
+                        
+                    result = engine.execute_trading_cycle(runtime_config=runtime_config)
                     
                     if result.get('success'):
                         log(f"[OK] Model {model_id} completed")
@@ -542,10 +746,21 @@ def trading_loop():
             # Get sleep time from settings
             settings = db.get_settings()
             sleep_minutes = settings.get('trading_frequency_minutes', 1)
-            # Cap at 60 seconds for simulation responsiveness, regardless of DB setting
-            sleep_seconds = max(10, min(sleep_minutes * 60, 60))
-
-            log(f"[SLEEP] Waiting {sleep_seconds} seconds for next cycle")
+            
+            # Check if any arbitrage strategy is active
+            has_arbitrage = any(
+                m.get('strategy_type') == 'arbitrage' 
+                for m in active_models
+            )
+            
+            if has_arbitrage:
+                # Arbitrage needs high frequency
+                sleep_seconds = 5 
+                log(f"[SLEEP] Arbitrage active: Waiting {sleep_seconds} seconds")
+            else:
+                # Cap at 60 seconds for simulation responsiveness
+                sleep_seconds = max(10, min(sleep_minutes * 60, 60))
+                log(f"[SLEEP] Waiting {sleep_seconds} seconds for next cycle")
             
             time.sleep(sleep_seconds)
             
@@ -803,7 +1018,7 @@ def init_trading_engines():
                     strategy = ArbitrageStrategy(
                         model_id=model_id,
                         market_service=market_service,
-                        config={'min_net_spread_pct': -5.0}
+                        config={'min_net_spread_pct': 0.01}
                     )
                 else:
                     # Get provider info for LLM strategy
@@ -877,6 +1092,15 @@ if __name__ == '__main__':
     print("[INFO] Initializing trading engines...")
     
     init_trading_engines()
+    
+    # Auto-start if active models exist
+    try:
+        active_models = db.get_active_models()
+        if active_models and not auto_trading:
+            print(f"[INIT] Found {len(active_models)} active models. Auto-starting trading loop...")
+            auto_trading = True
+    except Exception as e:
+        print(f"[WARN] Failed to check active models for auto-start: {e}")
     
     if auto_trading:
         trading_thread = threading.Thread(target=trading_loop, daemon=True)

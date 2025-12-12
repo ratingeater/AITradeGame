@@ -189,6 +189,10 @@ class Database:
             cursor.execute('ALTER TABLE models ADD COLUMN account_id INTEGER')
         except sqlite3.OperationalError:
             pass
+        try:
+            cursor.execute('ALTER TABLE models ADD COLUMN is_active INTEGER DEFAULT 1')
+        except sqlite3.OperationalError:
+            pass
 
         # Update Trades table (add fee column if not exist)
         try:
@@ -606,18 +610,26 @@ class Database:
 
     # ============ Model Management (Updated) ============
 
-    def add_model(self, name: str, provider_id: int, model_name: str, initial_capital: float = 10000, strategy_type: str = 'llm_json', account_id: int = None) -> int:
+    def add_model(self, name: str, provider_id: int, model_name: str, initial_capital: float = 10000, strategy_type: str = 'llm_json', account_id: int = None, config: str = '{}') -> int:
         """Add new trading model"""
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO models (name, provider_id, model_name, initial_capital, strategy_type, account_id)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (name, provider_id, model_name, initial_capital, strategy_type, account_id))
+            INSERT INTO models (name, provider_id, model_name, initial_capital, strategy_type, account_id, config)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (name, provider_id, model_name, initial_capital, strategy_type, account_id, config))
         model_id = cursor.lastrowid
         conn.commit()
         conn.close()
         return model_id
+
+    def update_model_config(self, model_id: int, config: str):
+        """Update model configuration"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('UPDATE models SET config = ? WHERE id = ?', (config, model_id))
+        conn.commit()
+        conn.close()
 
     def get_model(self, model_id: int) -> Optional[Dict]:
         """Get model information"""
@@ -648,6 +660,25 @@ class Database:
         return [dict(row) for row in rows]
 
     def get_active_models(self) -> List[Dict]:
-        """Get active trading models (currently all models)"""
-        return self.get_all_models()
+        """Get active trading models"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT m.*, p.name as provider_name
+            FROM models m
+            LEFT JOIN providers p ON m.provider_id = p.id
+            WHERE m.is_active = 1
+            ORDER BY m.created_at DESC
+        ''')
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    def toggle_model_status(self, model_id: int, is_active: bool):
+        """Toggle model active status"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('UPDATE models SET is_active = ? WHERE id = ?', (1 if is_active else 0, model_id))
+        conn.commit()
+        conn.close()
 

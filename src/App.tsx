@@ -28,6 +28,8 @@ import { Portfolio } from './services/aiTrader';
 import { Strategy, Signal } from './services/strategies/types';
 import { ArbitrageStrategy } from './services/strategies/ArbitrageStrategy';
 import { LLMStrategy } from './services/strategies/LLMStrategy';
+import SettingsModal from './components/SettingsModal';
+import ModelSettingsModal from './components/ModelSettingsModal';
 
 // Default Configuration
 const DEFAULT_API_URL = "https://api.deepseek.com/v3.2_speciale_expires_on_20251215";
@@ -39,17 +41,26 @@ function App() {
   const [showAddModelModal, setShowAddModelModal] = useState(false);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [showUpdateModal, setShowUpdateModal] = useState(false);
+  const [settingsModel, setSettingsModel] = useState<{id: number, name: string} | null>(null);
   const [showLeaderboardModal, setShowLeaderboardModal] = useState(false);
   const [leaderboardData, setLeaderboardData] = useState<any[]>([]);
 
   // App State
   const [apiKey, setApiKey] = useState('');
-  const [okxConfig, setOkxConfig] = useState({
-    apiKey: '',
-    secret: '',
-    passphrase: '',
-    isSimulation: true
+  const [okxConfig, setOkxConfig] = useState(() => {
+    const saved = localStorage.getItem('okxConfig');
+    return saved ? JSON.parse(saved) : {
+      apiKey: '',
+      secret: '',
+      passphrase: '',
+      isSimulation: true
+    };
   });
+
+  useEffect(() => {
+    localStorage.setItem('okxConfig', JSON.stringify(okxConfig));
+  }, [okxConfig]);
+
   const [isTrading, setIsTrading] = useState(() => {
     const saved = localStorage.getItem('isTrading');
     return saved ? JSON.parse(saved) : false;
@@ -236,6 +247,10 @@ function App() {
       addLog("Requesting backend execution...");
       const res = await fetch(`/api/models/${modelId}/execute`, { 
         method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          okx_config: okxConfigRef.current
+        }),
         signal: controller.signal
       });
       if (res.ok) {
@@ -273,7 +288,13 @@ function App() {
     
     const action = backendStatus.auto_trading ? 'stop' : 'start';
     try {
-      const res = await fetch(`/api/control/${action}`, { method: 'POST' });
+      const res = await fetch(`/api/control/${action}`, { 
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          okx_config: okxConfigRef.current
+        })
+      });
       if (res.ok) {
         const data = await res.json();
         setBackendStatus(prev => prev ? ({ ...prev, auto_trading: data.auto_trading }) : null);
@@ -294,13 +315,11 @@ function App() {
       const res = await fetch(`/api/models/${id}`, { method: 'DELETE' });
       if (res.ok) {
         // Refresh models
-        const modelsRes = await fetch('/api/models');
+        const modelsRes = await fetch(`/api/models?t=${Date.now()}`);
         if (modelsRes.ok) setBackendModels(await modelsRes.json());
         if (activeStrategyId === `backend-${id}`) {
             setActiveStrategyId('arbitrage_bot');
         }
-        // We can't call addLog here easily if it's defined below, but hoisting works for function declarations. 
-        // Since addLog is const, it's not hoisted. I'll just alert or console log.
         console.log("Model deleted");
       } else {
           alert("Failed to delete model");
@@ -308,6 +327,38 @@ function App() {
     } catch (e) {
       console.error(e);
       alert("Error deleting model");
+    }
+  };
+
+  const handleToggleModelActive = async (e: React.MouseEvent, id: number, currentStatus: boolean) => {
+    e.stopPropagation();
+
+    // If enabling a model, and global auto-trading is OFF, turn it ON
+    if (!currentStatus && backendStatus && !backendStatus.auto_trading) {
+        try {
+            console.log("Auto-starting global trading loop...");
+            await fetch('/api/control/start', { method: 'POST' });
+            // Update local status immediately to reflect change
+            setBackendStatus(prev => prev ? {...prev, auto_trading: true} : prev);
+            addLog("Global Auto-Trading started automatically");
+        } catch (err) {
+            console.error("Failed to auto-start global trading", err);
+        }
+    }
+
+    try {
+      const res = await fetch(`/api/models/${id}/toggle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ is_active: !currentStatus })
+      });
+      if (res.ok) {
+        // Refresh models to update UI
+        const modelsRes = await fetch(`/api/models?t=${Date.now()}`);
+        if (modelsRes.ok) setBackendModels(await modelsRes.json());
+      }
+    } catch (e) {
+      console.error("Failed to toggle model", e);
     }
   };
 
@@ -381,7 +432,7 @@ function App() {
     const fetchBackendData = async () => {
       try {
         const [modelsRes, providersRes] = await Promise.all([
-          fetch('/api/models'),
+          fetch(`/api/models?t=${Date.now()}`),
           fetch('/api/providers')
         ]);
         if (modelsRes.ok) setBackendModels(await modelsRes.json());
@@ -432,7 +483,7 @@ function App() {
         addLog(`Model added: ${result.message}`);
         setShowAddModelModal(false);
         // Refresh models
-        const modelsRes = await fetch('/api/models');
+        const modelsRes = await fetch(`/api/models?t=${Date.now()}`);
         if (modelsRes.ok) setBackendModels(await modelsRes.json());
       } else {
         const err = await response.json();
@@ -463,6 +514,13 @@ function App() {
             setLastDataFetchSuccess(true);
             const data = await res.json();
             setPortfolio(data.portfolio);
+            
+            if (data.portfolio.sync_error) {
+                addLog(`[Error] OKX Sync Failed: ${data.portfolio.sync_error}`);
+            } else if (data.portfolio.okx_synced) {
+                // Optional: Log success occasionally or just rely on UI indicator
+            }
+
             // Reverse to show oldest to newest
             setPortfolioHistory(data.account_value_history.reverse().map((h: any) => {
               const timeStr = h.timestamp.replace(' ', 'T');
@@ -732,10 +790,10 @@ function App() {
                   onClick={handleToggleBackend}
                   style={{ marginRight: 10 }}
                   disabled={!backendStatus}
-                  title={!backendStatus ? "Backend Offline" : (backendStatus.auto_trading ? "Stop Auto-Trading" : "Start Auto-Trading")}
+                  title={!backendStatus ? "Backend Offline" : (backendStatus.auto_trading ? "Stop Global Auto-Trading" : "Start Global Auto-Trading")}
                 >
                   {backendStatus?.auto_trading ? <Pause size={16} /> : <Play size={16} />}
-                  {backendStatus?.auto_trading ? ' 停止自动' : ' 自动运行'}
+                  {backendStatus?.auto_trading ? ' 停止全局自动' : ' 开启全局自动'}
                 </button>
                 <button 
                   className={`btn-primary ${isBackendRunning ? 'bg-gray-500 hover:bg-gray-600' : 'bg-blue-500 hover:bg-blue-600'}`}
@@ -818,11 +876,44 @@ function App() {
                     key={`backend-${model.id}`}
                     className={`model-item ${activeStrategyId === `backend-${model.id}` ? 'active' : ''}`}
                     onClick={() => setActiveStrategyId(`backend-${model.id}`)}
-                    style={{ cursor: 'pointer', borderLeft: '3px solid #10b981' }}
+                    style={{ cursor: 'pointer', borderLeft: `3px solid ${model.is_active ? '#10b981' : '#9ca3af'}` }}
                   >
                     <div className="model-name" style={{ display: 'flex', alignItems: 'center', gap: '8px', flex: 1 }}>
-                      <Cloud size={16} className="text-success" />
-                      <span style={{flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>{model.name}</span>
+                      <Cloud size={16} className={model.is_active ? "text-success" : "text-muted"} />
+                      <span style={{flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: model.is_active ? 'inherit' : '#999'}}>
+                        {model.name}
+                      </span>
+                      
+                      <button 
+                        className={`btn-icon ${model.is_active ? 'text-success' : 'text-muted'}`}
+                        onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            console.log("Toggle clicked for", model.id);
+                            handleToggleModelActive(e, model.id, !!model.is_active);
+                        }}
+                        title={
+                            backendStatus && !backendStatus.auto_trading 
+                            ? "Global Auto-Trading is OFF (Enable it top-right)" 
+                            : (model.is_active ? "Pause Strategy" : "Resume Strategy")
+                        }
+                        style={{padding: '4px', zIndex: 10, position: 'relative'}}
+                      >
+                        {model.is_active ? <Pause size={14} /> : <Play size={14} />}
+                      </button>
+
+                      <button 
+                        className="btn-icon text-primary" 
+                        onClick={(e) => {
+                            e.stopPropagation();
+                            setSettingsModel({id: model.id, name: model.name});
+                        }}
+                        title="策略配置 / Strategy Settings"
+                        style={{padding: '2px', opacity: 0.8}}
+                      >
+                        <Settings size={14} />
+                      </button>
+
                       <button 
                         className="btn-icon text-danger model-delete-btn" 
                         onClick={(e) => handleDeleteModel(e, model.id)}
@@ -877,7 +968,15 @@ function App() {
             <div className="stat-card">
               <div className="stat-header">
                 <span className="stat-label">账户总值</span>
-                <Wallet className="text-primary" size={20} />
+                <div style={{display: 'flex', alignItems: 'center', gap: '5px'}}>
+                    {(portfolio as any).okx_synced && (
+                        <span className="badge badge-success" style={{fontSize: '10px', padding: '2px 6px'}}>OKX</span>
+                    )}
+                    {(portfolio as any).sync_error && (
+                        <span className="badge badge-danger" title={(portfolio as any).sync_error} style={{fontSize: '10px', padding: '2px 6px'}}>Error</span>
+                    )}
+                    <Wallet className="text-primary" size={20} />
+                </div>
               </div>
               <div className="stat-value">${portfolio.total_value.toFixed(2)}</div>
             </div>
@@ -1282,77 +1381,12 @@ function App() {
       )}
 
       {/* Settings Modal */}
-      {showSettingsModal && (
-        <div className="modal show">
-          <div className="modal-content">
-            <div className="modal-header">
-              <h3>系统设置</h3>
-              <button className="btn-close" onClick={() => setShowSettingsModal(false)}>
-                <X size={20} />
-              </button>
-            </div>
-            <div className="modal-body">
-              <div className="form-group">
-                <label>交易频率（分钟）</label>
-                <input type="number" min="1" max="1440" className="form-input" placeholder="60" />
-                <small className="form-help">设置AI交易决策的时间间隔（1-1440分钟）</small>
-              </div>
-              <div className="form-group">
-                <label>交易费率</label>
-                <input type="number" min="0" max="0.01" step="0.0001" className="form-input" placeholder="0.001" />
-                <small className="form-help">每笔交易的手续费费率（0-0.01，例如0.001表示0.1%）</small>
-              </div>
-              
-              <div className="divider" style={{ margin: '20px 0', borderTop: '1px solid #eee' }}></div>
-              <h4>OKX 模拟盘配置</h4>
-              
-              <div className="form-group">
-                <label>API Key</label>
-                <input 
-                  type="text" 
-                  className="form-input" 
-                  value={okxConfig.apiKey}
-                  onChange={(e) => setOkxConfig({...okxConfig, apiKey: e.target.value})}
-                  placeholder="输入 OKX API Key" 
-                />
-              </div>
-              <div className="form-group">
-                <label>Secret Key</label>
-                <input 
-                  type="password" 
-                  className="form-input" 
-                  value={okxConfig.secret}
-                  onChange={(e) => setOkxConfig({...okxConfig, secret: e.target.value})}
-                  placeholder="输入 OKX Secret Key" 
-                />
-              </div>
-              <div className="form-group">
-                <label>Passphrase</label>
-                <input 
-                  type="password" 
-                  className="form-input" 
-                  value={okxConfig.passphrase}
-                  onChange={(e) => setOkxConfig({...okxConfig, passphrase: e.target.value})}
-                  placeholder="输入 OKX Passphrase" 
-                />
-              </div>
-              <div className="form-group" style={{display: 'flex', alignItems: 'center', gap: '10px'}}>
-                <input 
-                  type="checkbox" 
-                  id="simMode"
-                  checked={okxConfig.isSimulation}
-                  onChange={(e) => setOkxConfig({...okxConfig, isSimulation: e.target.checked})}
-                />
-                <label htmlFor="simMode" style={{marginBottom: 0}}>启用模拟盘模式 (Simulation)</label>
-              </div>
-            </div>
-            <div className="modal-footer">
-              <button className="btn-secondary" onClick={() => setShowSettingsModal(false)}>取消</button>
-              <button className="btn-primary">保存设置</button>
-            </div>
-          </div>
-        </div>
-      )}
+      <SettingsModal 
+        isOpen={showSettingsModal} 
+        onClose={() => setShowSettingsModal(false)}
+        okxConfig={okxConfig}
+        setOkxConfig={setOkxConfig}
+      />
 
       {/* Update Modal */}
       {showUpdateModal && (
@@ -1404,6 +1438,15 @@ function App() {
             </div>
           </div>
         </div>
+      )}
+      {/* Model Settings Modal */}
+      {settingsModel && (
+        <ModelSettingsModal 
+          isOpen={true}
+          onClose={() => setSettingsModel(null)}
+          modelId={settingsModel.id}
+          modelName={settingsModel.name}
+        />
       )}
     </div>
   );

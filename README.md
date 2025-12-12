@@ -86,7 +86,7 @@ After configuring providers, add trading models:
 
 ### System Settings
 Click the "Settings" button to configure:
-- Trading Frequency: Control AI decision interval (1-1440 minutes)
+- Trading Frequency: Control AI decision interval (1-1440 minutes). Note: Arbitrage strategy runs automatically at 5s frequency.
 - Trading Fee Rate: Commission rate per trade (default 0.1%)
 
 ## Supported AI Models

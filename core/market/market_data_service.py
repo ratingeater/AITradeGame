@@ -37,6 +37,12 @@ class MarketDataService:
         self._cache = {}
         self._cache_time = {}
         self._cache_duration = 5  # Cache for 5 seconds
+        
+        self.api_configs = {} # Store API configs for CCXT
+
+    def set_api_configs(self, configs: Dict):
+        """Set API configurations for exchanges"""
+        self.api_configs = configs
 
     def get_spot_snapshot(self, coins: List[str]) -> Dict[str, dict]:
         """Get current prices and indicators for multiple coins"""
@@ -53,11 +59,120 @@ class MarketDataService:
             }
         return snapshot
 
-    def get_multi_exchange_orderbooks(self, exchanges: List[str], symbol: str) -> List[Dict]:
+    def get_multi_exchange_orderbooks(self, exchanges: List[str], symbol: str, api_configs: Dict = None) -> List[Dict]:
         """
         Get orderbooks from multiple exchanges for a symbol.
-        For now, this simulates spreads based on the main price.
+        Uses CCXT for real data, falls back to simulation if failed.
+        api_configs: Dict of exchange configs, e.g. {'okx': {'apiKey': '...', ...}}
         """
+        import random
+        import ccxt
+        
+        orderbooks = []
+        
+        # Try to fetch real data first
+        try:
+            for ex_name in exchanges:
+                try:
+                    # Initialize exchange
+                    if not hasattr(ccxt, ex_name.lower()):
+                        continue
+                        
+                    exchange_class = getattr(ccxt, ex_name.lower())
+                    
+                    # Prepare config
+                    config = {
+                        'enableRateLimit': True,
+                        'timeout': 3000
+                    }
+                    
+                    # Inject API keys if available
+                    if api_configs and ex_name.lower() in api_configs:
+                        ex_config = api_configs[ex_name.lower()]
+                        if ex_config.get('apiKey'):
+                            config['apiKey'] = ex_config['apiKey']
+                            config['secret'] = ex_config['secret']
+                            if ex_config.get('passphrase'):
+                                config['password'] = ex_config['passphrase']
+                            
+                            # Set sandbox mode if configured
+                            if ex_config.get('isSimulation'):
+                                exchange = exchange_class(config)
+                                exchange.set_sandbox_mode(True)
+                            else:
+                                exchange = exchange_class(config)
+                        else:
+                            exchange = exchange_class(config)
+                    else:
+                        exchange = exchange_class(config)
+                    
+                    # Map symbol: BTC -> BTC/USDT
+                    ccxt_symbol = f"{symbol}/USDT" if '/' not in symbol else symbol
+                    
+                    # Fetch order book
+                    ob = exchange.fetch_order_book(ccxt_symbol, limit=5)
+                    
+                    if ob['bids'] and ob['asks']:
+                        orderbooks.append({
+                            "exchange": ex_name,
+                            "symbol": symbol,
+                            "bid_price": ob['bids'][0][0],
+                            "ask_price": ob['asks'][0][0],
+                            "bid_qty": ob['bids'][0][1],
+                            "ask_qty": ob['asks'][0][1]
+                        })
+                    else:
+                        print(f"[WARN] {ex_name} returned empty orderbook for {symbol}")
+                except Exception as e:
+                    print(f"[WARN] Failed to fetch {ex_name} orderbook: {e}")
+                    continue
+                    
+        except Exception as e:
+            print(f"[ERROR] CCXT fetch failed: {e}")
+            
+        print(f"[DEBUG] Orderbooks fetched: {len(orderbooks)}/{len(exchanges)}")
+            
+        # If we got data, return it
+        if len(orderbooks) == len(exchanges):
+            return orderbooks
+            
+        # If we have partial data (e.g. OKX worked but Binance failed), simulate the rest
+        # This ensures strategies that need 2 exchanges (Arbitrage) can still run in "Game" mode
+        if orderbooks and len(orderbooks) < len(exchanges):
+            print(f"[INFO] Partial market data ({len(orderbooks)}/{len(exchanges)}). Simulating missing exchanges for {symbol}.")
+            
+            # Identify missing exchanges
+            found_exchanges = {ob['exchange'] for ob in orderbooks}
+            missing_exchanges = [ex for ex in exchanges if ex not in found_exchanges]
+            
+            # Use the first valid orderbook as base
+            base_ob = orderbooks[0]
+            base_price = (base_ob['bid_price'] + base_ob['ask_price']) / 2
+            
+            for ex in missing_exchanges:
+                # Simulate small deviation to create arbitrage opportunity
+                # Random deviation between -0.5% and +0.5% (Total 1% range) to cover fees (0.2%)
+                deviation = (random.random() - 0.5) * 0.01 * base_price 
+                price = base_price + deviation
+                spread = price * 0.001 # 0.1% spread
+                
+                orderbooks.append({
+                    "exchange": ex,
+                    "symbol": symbol,
+                    "bid_price": price - spread/2,
+                    "ask_price": price + spread/2,
+                    "bid_qty": random.uniform(0.1, 2.0),
+                    "ask_qty": random.uniform(0.1, 2.0),
+                    "is_simulated": True
+                })
+                
+            return orderbooks
+
+        # Fallback to simulation if ALL failed
+        return self._simulate_orderbooks(exchanges, symbol)
+
+    def _simulate_orderbooks(self, exchanges: List[str], symbol: str) -> List[Dict]:
+        """Simulate orderbooks for testing"""
         import random
         
         # Get base price
@@ -84,7 +199,7 @@ class MarketDataService:
         return orderbooks
 
     def get_current_prices(self, coins: List[str]) -> Dict[str, float]:
-        """Get current prices from CryptoCompare (Primary) -> Binance -> CoinGecko"""
+        """Get current prices from CCXT (if configured) -> CryptoCompare -> Binance -> CoinGecko"""
         # Check cache
         cache_key = 'prices_' + '_'.join(sorted(coins))
         if cache_key in self._cache:
@@ -92,6 +207,43 @@ class MarketDataService:
                 return self._cache[cache_key]
         
         prices = {}
+
+        # 0. Try CCXT/OKX if configured
+        if self.api_configs and 'okx' in self.api_configs:
+            try:
+                import ccxt
+                okx_config = self.api_configs['okx']
+                if okx_config.get('apiKey'):
+                    exchange = ccxt.okx({
+                        'apiKey': okx_config['apiKey'],
+                        'secret': okx_config['secret'],
+                        'password': okx_config.get('passphrase'),
+                        'enableRateLimit': True,
+                        'timeout': 3000
+                    })
+                    if okx_config.get('isSimulation'):
+                        exchange.set_sandbox_mode(True)
+                    
+                    # Fetch tickers
+                    # Map coins to symbols
+                    symbols = [f"{coin}/USDT" for coin in coins]
+                    tickers = exchange.fetch_tickers(symbols)
+                    
+                    for symbol, ticker in tickers.items():
+                        coin = symbol.split('/')[0]
+                        if coin in coins:
+                            prices[coin] = {
+                                'price': float(ticker['last']),
+                                'change_24h': float(ticker['percentage'] or 0)
+                            }
+                    
+                    if len(prices) == len(coins):
+                        # Update cache
+                        self._cache[cache_key] = prices
+                        self._cache_time[cache_key] = time.time()
+                        return prices
+            except Exception as e:
+                print(f"[WARN] OKX Price Fetch failed: {e}")
 
         # Try CryptoCompare first (Most reliable for public access)
         try:

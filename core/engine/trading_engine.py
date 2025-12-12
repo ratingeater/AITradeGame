@@ -15,7 +15,7 @@ class TradingEngine:
         self.trade_fee_rate = trade_fee_rate
         self.coins = ['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE']
     
-    def execute_trading_cycle(self) -> Dict:
+    def execute_trading_cycle(self, runtime_config: Dict = None) -> Dict:
         print(f"[DEBUG] Engine: Executing cycle for model {self.model_id}")
         try:
             # 1. Get Market State
@@ -25,10 +25,50 @@ class TradingEngine:
             # 2. Get Portfolio
             portfolio = self.db.get_portfolio(self.model_id, current_prices)
             
+            # Sync with Real Exchange if configured
+            if runtime_config and 'okx' in runtime_config:
+                try:
+                    okx_config = runtime_config['okx']
+                    if okx_config.get('apiKey'):
+                        import ccxt
+                        exchange = ccxt.okx({
+                            'apiKey': okx_config['apiKey'],
+                            'secret': okx_config['secret'],
+                            'password': okx_config.get('passphrase'),
+                            'timeout': 5000,
+                            'enableRateLimit': True
+                        })
+                        if okx_config.get('isSimulation'):
+                            exchange.set_sandbox_mode(True)
+                            
+                        balance = exchange.fetch_balance()
+                        total_usdt = balance['total'].get('USDT', 0)
+                        free_usdt = balance['free'].get('USDT', 0)
+                        
+                        # Update portfolio cash (Available USDT)
+                        portfolio['cash'] = free_usdt
+                        
+                        # Update total value (Approximate)
+                        # Note: This doesn't fully sync positions yet, but gives correct cash basis
+                        portfolio['total_value'] = balance['total']['USDT'] # Simplified
+                        
+                        print(f"[INFO] Synced balance from OKX: {free_usdt} USDT")
+                except Exception as e:
+                    print(f"[WARN] Failed to sync balance: {e}")
+            
             # 3. Build Account Info
             account_info = self._build_account_info(portfolio)
             
             # 4. Build Strategy Context
+            extra_data = {
+                "symbols": self.coins,
+                "exchanges": ["Binance", "OKX"] # Default for arbitrage
+            }
+            
+            # Merge runtime config if provided (e.g. API keys)
+            if runtime_config:
+                extra_data.update(runtime_config)
+            
             ctx = StrategyContext(
                 model_id=self.model_id,
                 account_id=None, # TODO: Support real accounts
@@ -36,10 +76,7 @@ class TradingEngine:
                 portfolio=portfolio,
                 account_info=account_info,
                 settings={"trade_fee_rate": self.trade_fee_rate},
-                extra={
-                    "symbols": self.coins,
-                    "exchanges": ["Binance", "OKX"] # Default for arbitrage
-                }
+                extra=extra_data
             )
             
             # 5. Generate Signals
@@ -85,7 +122,7 @@ class TradingEngine:
                     print(f"[ERROR] Failed to save log to DB: {e}")
             
             # 7. Execute Signals
-            execution_results = self._execute_signals(signals, market_state, portfolio)
+            execution_results = self._execute_signals(signals, market_state, portfolio, runtime_config)
             
             # 8. Update Account Value History
             updated_portfolio = self.db.get_portfolio(self.model_id, current_prices)
@@ -145,7 +182,7 @@ class TradingEngine:
         }
     
     def _execute_signals(self, signals: List[Signal], market_state: Dict, 
-                          portfolio: Dict) -> list:
+                          portfolio: Dict, runtime_config: Dict = None) -> list:
         results = []
         
         for signal in signals:
@@ -161,11 +198,11 @@ class TradingEngine:
 
             try:
                 if signal.action == 'buy':
-                    result = self._execute_buy(market_coin, signal, market_state, portfolio)
+                    result = self._execute_buy(market_coin, signal, market_state, portfolio, runtime_config)
                 elif signal.action == 'sell':
-                    result = self._execute_sell(market_coin, signal, market_state, portfolio)
+                    result = self._execute_sell(market_coin, signal, market_state, portfolio, runtime_config)
                 elif signal.action == 'close':
-                    result = self._execute_close(market_coin, signal, market_state, portfolio)
+                    result = self._execute_close(market_coin, signal, market_state, portfolio, runtime_config)
                 elif signal.action == 'hold':
                     result = {'coin': coin, 'signal': 'hold', 'message': 'Hold position'}
                 else:
@@ -179,7 +216,7 @@ class TradingEngine:
         return results
     
     def _execute_buy(self, coin: str, signal: Signal, market_state: Dict, 
-                    portfolio: Dict) -> Dict:
+                    portfolio: Dict, runtime_config: Dict = None) -> Dict:
         quantity = signal.quantity
         leverage = signal.leverage
         # Use price from signal if available (e.g. for Arbitrage), otherwise market price
@@ -187,6 +224,15 @@ class TradingEngine:
         
         if quantity <= 0:
             return {'coin': coin, 'error': 'Invalid quantity'}
+        
+        # Execute on Exchange if configured
+        exchange_result = self._execute_on_exchange('buy', coin, quantity, runtime_config)
+        exchange_msg = ""
+        if exchange_result:
+            if 'error' in exchange_result:
+                exchange_msg = f" [OKX Error: {exchange_result['error']}]"
+            else:
+                exchange_msg = f" [OKX Order: {exchange_result.get('id')}]"
         
         # Calculate amounts
         trade_amount = quantity * price
@@ -239,11 +285,11 @@ class TradingEngine:
             'price': price,
             'leverage': leverage,
             'fee': trade_fee,
-            'message': f'Long {quantity:.4f} {coin} @ ${price:.2f} (Fee: ${trade_fee:.2f})'
+            'message': f'Long {quantity:.4f} {coin} @ ${price:.2f} (Fee: ${trade_fee:.2f}){exchange_msg}'
         }
     
     def _execute_sell(self, coin: str, signal: Signal, market_state: Dict, 
-                 portfolio: Dict) -> Dict:
+                 portfolio: Dict, runtime_config: Dict = None) -> Dict:
         quantity = signal.quantity
         leverage = signal.leverage
         # Use price from signal if available
@@ -251,6 +297,15 @@ class TradingEngine:
         
         if quantity <= 0:
             return {'coin': coin, 'error': 'Invalid quantity'}
+        
+        # Execute on Exchange if configured
+        exchange_result = self._execute_on_exchange('sell', coin, quantity, runtime_config)
+        exchange_msg = ""
+        if exchange_result:
+            if 'error' in exchange_result:
+                exchange_msg = f" [OKX Error: {exchange_result['error']}]"
+            else:
+                exchange_msg = f" [OKX Order: {exchange_result.get('id')}]"
         
         trade_amount = quantity * price
         trade_fee = trade_amount * self.trade_fee_rate
@@ -300,11 +355,11 @@ class TradingEngine:
             'price': price,
             'leverage': leverage,
             'fee': trade_fee,
-            'message': f'Short {quantity:.4f} {coin} @ ${price:.2f} (Fee: ${trade_fee:.2f})'
+            'message': f'Short {quantity:.4f} {coin} @ ${price:.2f} (Fee: ${trade_fee:.2f}){exchange_msg}'
         }
     
     def _execute_close(self, coin: str, signal: Signal, market_state: Dict, 
-                    portfolio: Dict) -> Dict:
+                    portfolio: Dict, runtime_config: Dict = None) -> Dict:
         position = None
         for pos in portfolio['positions']:
             if pos['coin'] == coin:
@@ -319,6 +374,17 @@ class TradingEngine:
         entry_price = position['avg_price']
         quantity = position['quantity']
         side = position['side']
+        
+        # Execute on Exchange if configured
+        # Close Long -> Sell, Close Short -> Buy
+        action = 'sell' if side == 'long' else 'buy'
+        exchange_result = self._execute_on_exchange(action, coin, quantity, runtime_config)
+        exchange_msg = ""
+        if exchange_result:
+            if 'error' in exchange_result:
+                exchange_msg = f" [OKX Error: {exchange_result['error']}]"
+            else:
+                exchange_msg = f" [OKX Order: {exchange_result.get('id')}]"
         
         if side == 'long':
             gross_pnl = (current_price - entry_price) * quantity
@@ -351,5 +417,38 @@ class TradingEngine:
             'price': current_price,
             'pnl': net_pnl,
             'fee': trade_fee,
-            'message': f'Close {coin}, Gross P&L: ${gross_pnl:.2f}, Fee: ${trade_fee:.2f}, Net P&L: ${net_pnl:.2f}'
+            'message': f'Close {coin}, Gross P&L: ${gross_pnl:.2f}, Fee: ${trade_fee:.2f}, Net P&L: ${net_pnl:.2f}{exchange_msg}'
         }
+
+    def _execute_on_exchange(self, action: str, symbol: str, quantity: float, runtime_config: Dict):
+        """Execute trade on external exchange via CCXT"""
+        if not runtime_config or 'okx' not in runtime_config:
+            return None
+            
+        okx_config = runtime_config['okx']
+        if not okx_config.get('apiKey'):
+            return None
+            
+        import ccxt
+        try:
+            exchange = ccxt.okx({
+                'apiKey': okx_config['apiKey'],
+                'secret': okx_config['secret'],
+                'password': okx_config.get('passphrase'),
+                'enableRateLimit': True
+            })
+            
+            if okx_config.get('isSimulation'):
+                exchange.set_sandbox_mode(True)
+                
+            # Map symbol
+            market_symbol = f"{symbol}/USDT" if '/' not in symbol else symbol
+            
+            # Execute
+            # For simplicity, using market orders
+            print(f"[EXEC] Sending {action} {quantity} {market_symbol} to OKX...")
+            return exchange.create_order(market_symbol, 'market', action, quantity)
+            
+        except Exception as e:
+            print(f"[ERROR] Exchange execution failed: {e}")
+            return {'error': str(e)}
